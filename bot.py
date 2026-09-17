@@ -1,3 +1,4 @@
+import logging
 import os
 import random
 from pathlib import Path
@@ -18,6 +19,16 @@ intents = discord.Intents.default()
 # privileged message content intent stays off. when_mentioned is exempt from
 # discord.py's missing intent warning.
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+
+
+# Loaded as an extension so the music feature stays out of this file. A failure to
+# load is logged rather than fatal, so the gif command keeps working regardless.
+@bot.event
+async def setup_hook():
+    try:
+        await bot.load_extension("music.cog")
+    except Exception:
+        logging.getLogger("music").exception("Failed to load the music cog")
 
 
 @bot.event
