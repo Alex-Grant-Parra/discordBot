@@ -151,13 +151,27 @@ def ensurePlaylist(sp, playlistName=None):
     created = False
     if playlist is None:
         # Spotify requires a collaborative playlist to be private, so public is forced off.
-        playlist = sp.user_playlist_create(
-            user=ownerId,
-            name=playlistName or defaultPlaylistName,
-            public=False,
-            collaborative=True,
-            description=defaultPlaylistDescription,
-        )
+        # current_user_playlist_create posts to me/playlists. The older user_playlist_create
+        # posts to users/{id}/playlists, which Spotify removed for Development Mode apps in
+        # its February 2026 Web API migration and now returns a bare 403 with no detail.
+        try:
+            playlist = sp.current_user_playlist_create(
+                name=playlistName or defaultPlaylistName,
+                public=False,
+                collaborative=True,
+                description=defaultPlaylistDescription,
+            )
+        except spotipy.SpotifyException as err:
+            if err.http_status == 403:
+                raise SpotifyAuthNotReady(
+                    "Spotify refused to create the playlist (403 forbidden) for account "
+                    + str(ownerId)
+                    + ". Check that this Spotify app has been added under Settings, User "
+                    "Management on the app's page at developer.spotify.com/dashboard if this "
+                    "account is not the one that created the app, then run this script again, "
+                    "no need to log in again."
+                ) from err
+            raise
         created = True
         playlist = fetchPlaylist(sp, playlist["id"]) or playlist
 
