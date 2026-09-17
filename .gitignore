@@ -1,0 +1,7 @@
+.env
+.env.backup.*
+venv/
+__pycache__/
+*.pyc
+music.db
+music.db-journal
