@@ -112,6 +112,11 @@ class MusicCog(commands.Cog):
         self.linked = False
         self.playing = False
         self.lastAnnouncedUri = None
+        self.currentTrack = None
+        # Tell the voice listener whether a disconnect was the bot's own doing.
+        self.leavingOnPurpose = False
+        self.switchingFromGuilds = set()
+        self.unloading = False
         # Songs played before the current one, newest last. go-librespot's own previous
         # only walks back through the current album or playlist and forgets queued
         # songs, which is most of what gets played here.
@@ -173,6 +178,7 @@ class MusicCog(commands.Cog):
         self.idleCheck.start()
 
     async def cog_unload(self):
+        self.unloading = True
         self.idleCheck.cancel()
         if self.controls is not None:
             self.controls.stop()
@@ -249,6 +255,10 @@ class MusicCog(commands.Cog):
             vc = self.voiceClient()
             if vc is not None and vc.is_paused():
                 vc.resume()
+            # Leaving voice deletes the now playing message, so resuming the same song
+            # afterwards needs it posted again.
+            if not store.getConfig("nowPlayingMessage") and self.currentTrack:
+                await self.announceTrack(self.currentTrack)
             await self.refreshControls(paused=False)
         elif kind in ("paused", "stopped", "inactive"):
             # Pausing the voice client stops the bot transmitting silence. What little
@@ -259,6 +269,7 @@ class MusicCog(commands.Cog):
                 vc.pause()
             await self.refreshControls(paused=True)
         elif kind == "metadata":
+            self.currentTrack = data
             if data.get("uri"):
                 self.rememberLabel(data["uri"], describeTrack(data))
             self.recordHistory(data.get("uri"))
@@ -303,6 +314,10 @@ class MusicCog(commands.Cog):
             raise
         asyncio.create_task(self.confirmWentBack(target))
         return self.labels.get(target) or "the previous song"
+
+    async def restartSong(self):
+        logger.info("Restart: back to the start of %s", self.currentUri)
+        await self.api.seek(0)
 
     async def confirmWentBack(self, target):
         # go-librespot accepts a skip even when it then fails to carry it out, and only
@@ -572,6 +587,8 @@ class MusicCog(commands.Cog):
                 await vc.move_to(channel)
             else:
                 if vc is not None:
+                    # Moving to another server, not leaving, so no cleanup for this one.
+                    self.switchingFromGuilds.add(vc.guild.id)
                     await vc.disconnect(force=True)
                 vc = await channel.connect(timeout=20.0, reconnect=True, self_deaf=True)
 
@@ -765,11 +782,7 @@ class MusicCog(commands.Cog):
         vc = self.voiceClient()
         if vc is None:
             raise UserFacingError("I am not in a voice channel.")
-        if self.playing:
-            try:
-                await self.api.pause()
-            except LibrespotError:
-                pass
+        self.leavingOnPurpose = True
         await vc.disconnect(force=False)
         await self.reply(interaction, self.who(interaction) + " stopped the music and sent me out of voice.")
 
@@ -1097,15 +1110,46 @@ class MusicCog(commands.Cog):
             return
 
         self.idleSince = None
-        if self.playing:
+        channelName = vc.channel.name
+        self.leavingOnPurpose = True
+        await vc.disconnect(force=False)
+        reason = "nobody was listening" if not listeners else "nothing was playing"
+        await self.notify("Left " + channelName + " because " + reason + ". Casting from Spotify will bring me back.")
+
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member, before, after):
+        # The one place leaving voice is cleaned up after, whether it was /leave, the idle
+        # timer, or someone disconnecting the bot. discord.py already closes its side of
+        # an outside disconnect, but the music would keep playing to nobody.
+        if self.unloading or self.bot.user is None or member.id != self.bot.user.id:
+            return
+        if before.channel is None or after.channel is not None:
+            return
+        if member.guild.id in self.switchingFromGuilds:
+            self.switchingFromGuilds.discard(member.guild.id)
+            return
+        onPurpose = self.leavingOnPurpose
+        self.leavingOnPurpose = False
+        await self.cleanUpAfterLeaving(before.channel, onPurpose)
+
+    async def cleanUpAfterLeaving(self, channel, onPurpose):
+        self.idleSince = None
+        wasPlaying = self.playing
+        if wasPlaying:
             try:
                 await self.api.pause()
             except LibrespotError:
                 pass
-        channelName = vc.channel.name
-        await vc.disconnect(force=False)
-        reason = "nobody was listening" if not listeners else "nothing was playing"
-        await self.notify("Left " + channelName + " because " + reason + ". Casting from Spotify will bring me back.")
+        await self.deleteNowPlayingMessage()
+        self.lastAnnouncedUri = None
+        self.controlsPaused = None
+        logger.info("Left voice channel %s (%s)", channel.name, "on purpose" if onPurpose else "disconnected by someone")
+        if not onPurpose:
+            await self.notify(
+                "Someone disconnected me from " + channel.name
+                + (", so I paused the music." if wasPlaying else ".")
+                + " Use /join or play from Spotify to bring me back."
+            )
 
     @idleCheck.before_loop
     async def beforeIdleCheck(self):
@@ -1124,6 +1168,10 @@ class PlayerControls(discord.ui.View):
     @discord.ui.button(label="Previous", emoji="\u23ee\ufe0f", style=discord.ButtonStyle.secondary, custom_id="music:previous")
     async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
         await self.cog.pressControl(interaction, self.cog.goBack)
+
+    @discord.ui.button(label="Restart", emoji="\U0001f504", style=discord.ButtonStyle.secondary, custom_id="music:restart")
+    async def restart(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.pressControl(interaction, self.cog.restartSong)
 
     @discord.ui.button(label="Pause", emoji="\u23f8\ufe0f", style=discord.ButtonStyle.primary, custom_id="music:playpause")
     async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
