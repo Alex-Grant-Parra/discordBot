@@ -4,6 +4,7 @@
 # commands here. Both drive the same player, so they always agree.
 
 import asyncio
+import json
 import logging
 import os
 import time
@@ -37,6 +38,7 @@ spotifyGreen = discord.Colour.from_rgb(30, 215, 96)
 defaultIdleSeconds = 300
 maxRememberedLabels = 500
 maxQueueLines = 10
+maxHistory = 50
 maxChoices = 25  # Discord's cap on autocomplete suggestions
 
 # The shared playlist is checked often while the bot is in voice and rarely otherwise,
@@ -110,6 +112,15 @@ class MusicCog(commands.Cog):
         self.linked = False
         self.playing = False
         self.lastAnnouncedUri = None
+        # Songs played before the current one, newest last. go-librespot's own previous
+        # only walks back through the current album or playlist and forgets queued
+        # songs, which is most of what gets played here.
+        self.history = []
+        self.currentUri = None
+        self.backTarget = None
+        # Play/pause state last drawn on the now playing buttons, None when unknown.
+        self.controlsPaused = None
+        self.controls = None
         self.warnedNoChannel = False
         self.voiceLock = asyncio.Lock()
         self.idleSince = None
@@ -133,8 +144,12 @@ class MusicCog(commands.Cog):
 
     async def cog_load(self):
         store.initDb()
+        self.loadHistory()
         await self.api.open()
         self.sp = await self.loadWebApi()
+        # Registered once so buttons on messages posted before a restart keep working.
+        self.controls = PlayerControls(self)
+        self.bot.add_view(self.controls)
 
         if not binaryPath.exists():
             logger.error(
@@ -159,6 +174,8 @@ class MusicCog(commands.Cog):
 
     async def cog_unload(self):
         self.idleCheck.cancel()
+        if self.controls is not None:
+            self.controls.stop()
         for task in self.backgroundTasks:
             task.cancel()
         for vc in list(self.bot.voice_clients):
@@ -232,6 +249,7 @@ class MusicCog(commands.Cog):
             vc = self.voiceClient()
             if vc is not None and vc.is_paused():
                 vc.resume()
+            await self.refreshControls(paused=False)
         elif kind in ("paused", "stopped", "inactive"):
             # Pausing the voice client stops the bot transmitting silence. What little
             # audio is still in flight stays buffered and plays first on resume.
@@ -239,8 +257,61 @@ class MusicCog(commands.Cog):
             vc = self.voiceClient()
             if vc is not None and vc.is_playing():
                 vc.pause()
+            await self.refreshControls(paused=True)
         elif kind == "metadata":
+            if data.get("uri"):
+                self.rememberLabel(data["uri"], describeTrack(data))
+            self.recordHistory(data.get("uri"))
             await self.announceTrack(data)
+
+    def loadHistory(self):
+        try:
+            saved = json.loads(store.getConfig("playHistory") or "{}")
+        except ValueError:
+            saved = {}
+        self.history = [uri for uri in saved.get("history") or [] if isinstance(uri, str)][-maxHistory:]
+        self.currentUri = saved.get("current")
+
+    def recordHistory(self, uri):
+        if not uri or uri == self.currentUri:
+            return
+        if uri == self.backTarget:
+            # Arrived by going back, so the song left behind is not history.
+            self.backTarget = None
+        elif self.currentUri:
+            self.history.append(self.currentUri)
+            del self.history[:-maxHistory]
+        self.currentUri = uri
+        # Saved so Previous still works straight after a restart.
+        store.setConfig("playHistory", json.dumps({"history": self.history, "current": uri}))
+
+    async def goBack(self):
+        # Returns the label of the song gone back to, or None when there was nothing
+        # earlier and the current song restarted instead.
+        if not self.history:
+            logger.info("Previous: nothing played before %s, restarting it", self.currentUri)
+            await self.api.seek(0)
+            return None
+        target = self.history.pop()
+        self.backTarget = target
+        logger.info("Previous: going back from %s to %s", self.currentUri, target)
+        try:
+            await self.api.skipTo(target)
+        except LibrespotError:
+            self.history.append(target)
+            self.backTarget = None
+            raise
+        asyncio.create_task(self.confirmWentBack(target))
+        return self.labels.get(target) or "the previous song"
+
+    async def confirmWentBack(self, target):
+        # go-librespot accepts a skip even when it then fails to carry it out, and only
+        # says why in its own log. This makes that visible next to the request.
+        for _ in range(10):
+            await asyncio.sleep(0.5)
+            if self.currentUri == target:
+                return
+        logger.warning("Previous: the speaker did not start %s within 5 seconds", target)
 
     async def announceTrack(self, track):
         uri = track.get("uri")
@@ -251,7 +322,60 @@ class MusicCog(commands.Cog):
         requester = self.requestedBy.pop(uri, None)
         if requester:
             embed.set_footer(text="Requested by " + requester)
-        await self.notify(embed=embed)
+
+        channel = self.textChannel()
+        if channel is None:
+            return
+        await self.deleteNowPlayingMessage()
+        paused = not self.playing
+        try:
+            message = await channel.send(embed=embed, view=PlayerControls(self, paused=paused))
+        except discord.HTTPException:
+            logger.exception("Failed to post the now playing message")
+            return
+        self.controlsPaused = paused
+        # Kept in the database so the message is still cleaned up after a restart.
+        store.setConfig("nowPlayingMessage", str(channel.id) + ":" + str(message.id))
+
+    def nowPlayingMessage(self):
+        channelId, _, messageId = (store.getConfig("nowPlayingMessage") or "").partition(":")
+        channel = self.bot.get_channel(int(channelId)) if channelId.isdigit() else None
+        if channel is None or not messageId.isdigit():
+            return None
+        return channel.get_partial_message(int(messageId))
+
+    async def deleteNowPlayingMessage(self):
+        message = self.nowPlayingMessage()
+        store.setConfig("nowPlayingMessage", "")
+        if message is None:
+            return
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass  # Already deleted by someone, or too old to matter.
+
+    async def refreshControls(self, paused):
+        # Switches the play/pause button between Pause and Resume.
+        if paused == self.controlsPaused:
+            return
+        message = self.nowPlayingMessage()
+        if message is None:
+            return
+        self.controlsPaused = paused
+        try:
+            await message.edit(view=PlayerControls(self, paused=paused))
+        except discord.HTTPException:
+            pass
+
+    async def pressControl(self, interaction, action):
+        try:
+            await self.requireSpeaker()
+            await action()
+        except (UserFacingError, LibrespotError) as err:
+            await interaction.response.send_message(self.describeError(err), ephemeral=True)
+            return
+        # The message updates itself from the speaker's events, nothing to reply.
+        await interaction.response.defer()
 
     def trackEmbed(self, track, heading, showPosition=False):
         embed = discord.Embed(
@@ -482,20 +606,25 @@ class MusicCog(commands.Cog):
 
     # Messages
 
-    async def notify(self, message=None, embed=None):
+    def textChannel(self):
         channelId = envChannelId("MUSIC_TEXT_CHANNEL_ID")
         if not channelId:
-            if message:
-                logger.info("No text channel configured, message not posted: %s", message)
-            return
+            return None
         channel = self.bot.get_channel(channelId)
         if channel is None:
             logger.warning("Text channel %d is not visible to the bot", channelId)
+        return channel
+
+    async def notify(self, message=None, embed=None):
+        channel = self.textChannel()
+        if channel is None:
+            if message:
+                logger.info("No text channel available, message not posted: %s", message)
             return
         try:
             await channel.send(content=message, embed=embed)
         except discord.HTTPException:
-            logger.exception("Failed to post a message to channel %d", channelId)
+            logger.exception("Failed to post a message to channel %d", channel.id)
 
     async def reply(self, interaction, message=None, embed=None, ephemeral=False, view=None):
         kwargs = {"ephemeral": ephemeral}
@@ -510,21 +639,22 @@ class MusicCog(commands.Cog):
         else:
             await interaction.response.send_message(**kwargs)
 
-    async def cog_app_command_error(self, interaction, error):
-        original = getattr(error, "original", error)
+    def describeError(self, original):
         if isinstance(original, UserFacingError):
-            message = str(original)
-        elif isinstance(original, NotLinkedError):
-            message = (
+            return str(original)
+        if isinstance(original, NotLinkedError):
+            return (
                 "The speaker is not paired with a Spotify account yet, so nothing can play. "
                 "The pairing link is in the bot's log for the Premium account's owner to approve."
             )
-        elif isinstance(original, LibrespotError):
+        if isinstance(original, LibrespotError):
             logger.warning("Speaker command failed: %s", original)
-            message = "The Spotify speaker could not do that: " + str(original)
-        else:
-            logger.exception("Music command failed", exc_info=original)
-            message = "Something went wrong: " + str(original)
+            return "The Spotify speaker could not do that: " + str(original)
+        logger.exception("Music command failed", exc_info=original)
+        return "Something went wrong: " + str(original)
+
+    async def cog_app_command_error(self, interaction, error):
+        message = self.describeError(getattr(error, "original", error))
         try:
             await self.reply(interaction, message, ephemeral=True)
         except discord.HTTPException:
@@ -722,11 +852,14 @@ class MusicCog(commands.Cog):
         await self.api.next()
         await self.reply(interaction, self.who(interaction) + " skipped the song.")
 
-    @app_commands.command(name="previous", description="Go back to the previous song, or the start of this one")
+    @app_commands.command(name="previous", description="Go back to the song that played before this one")
     async def previous(self, interaction: discord.Interaction):
         await self.requireSpeaker()
-        await self.api.prev()
-        await self.reply(interaction, self.who(interaction) + " went back a song.")
+        label = await self.goBack()
+        if label is None:
+            await self.reply(interaction, self.who(interaction) + " restarted the song, nothing played before it.")
+            return
+        await self.reply(interaction, self.who(interaction) + " went back to " + label + ".")
 
     @app_commands.command(name="seek", description="Jump to a point in the current song")
     @app_commands.describe(position="Where to jump to, like 1:30 or 90")
@@ -977,6 +1110,28 @@ class MusicCog(commands.Cog):
     @idleCheck.before_loop
     async def beforeIdleCheck(self):
         await self.bot.wait_until_ready()
+
+
+class PlayerControls(discord.ui.View):
+    # Buttons under the now playing message. Fixed custom ids make them persistent, so
+    # they keep working on messages posted before the bot restarted.
+    def __init__(self, cog, paused=False):
+        super().__init__(timeout=None)
+        self.cog = cog
+        self.toggle.label = "Resume" if paused else "Pause"
+        self.toggle.emoji = "\u25b6\ufe0f" if paused else "\u23f8\ufe0f"
+
+    @discord.ui.button(label="Previous", emoji="\u23ee\ufe0f", style=discord.ButtonStyle.secondary, custom_id="music:previous")
+    async def previous(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.pressControl(interaction, self.cog.goBack)
+
+    @discord.ui.button(label="Pause", emoji="\u23f8\ufe0f", style=discord.ButtonStyle.primary, custom_id="music:playpause")
+    async def toggle(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.pressControl(interaction, self.cog.api.playPause)
+
+    @discord.ui.button(label="Next", emoji="\u23ed\ufe0f", style=discord.ButtonStyle.secondary, custom_id="music:next")
+    async def skipNext(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await self.cog.pressControl(interaction, self.cog.api.next)
 
 
 class LinkView(discord.ui.View):

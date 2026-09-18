@@ -1,3 +1,4 @@
+import fcntl
 import logging
 import os
 import random
@@ -60,8 +61,23 @@ async def gif(interaction: discord.Interaction):
     await interaction.response.send_message(file=discord.File(choice))
 
 
+def holdSingleInstanceLock():
+    # Two copies would share one Spotify speaker and audio pipe and both answer every
+    # command. The lock is released by the kernel when the process exits, however it exits.
+    lockFile = open(Path(__file__).with_name(".bot.lock"), "w")
+    try:
+        fcntl.flock(lockFile, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        raise SystemExit(
+            "Another copy of the bot is already running, usually the discordbot systemd "
+            "service. Restart that with: sudo systemctl restart discordbot"
+        )
+    return lockFile
+
+
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN is not set. Add it to your .env file.")
+    instanceLock = holdSingleInstanceLock()
     # root_logger makes the music feature's own log lines show up next to discord.py's.
     bot.run(TOKEN, root_logger=True)
