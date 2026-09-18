@@ -30,6 +30,7 @@ from .librespot import (
     binaryPath,
     deviceName,
     fifoPath,
+    jamInviteUrl,
 )
 
 logger = logging.getLogger("music")
@@ -1037,6 +1038,59 @@ class MusicCog(commands.Cog):
             inline=False,
         )
         await self.reply(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(name="jam", description="Start a Spotify Jam on the speaker and post the invite (speaker account owner only)")
+    async def jam(self, interaction: discord.Interaction):
+        await self.requireSpeaker()
+        status = await self.api.status()
+        if status is None:
+            raise NotLinkedError()
+        # Only the person who owns the speaker's Spotify account may start a Jam on it,
+        # proven by their /link login being that same account.
+        profile = store.loadUserProfile(interaction.user.id)
+        if not profile or profile.get("spotifyUserId") != status.get("username"):
+            raise UserFacingError(
+                "Only the owner of the speaker's Spotify account can start a Jam. If that is "
+                "you, run /link and log in with that account first."
+            )
+
+        await interaction.response.defer(ephemeral=True)
+        await self.connectForCommand(interaction)
+        session = await self.api.currentOrNewJam(status.get("device_id"))
+        link = jamInviteUrl + session["join_session_token"]
+        guests = sum(1 for member in session.get("session_members") or [] if not member.get("is_current_user"))
+        logger.info("Jam invite posted by %s, %d guest(s) already in it", self.who(interaction), guests)
+
+        channel = self.textChannel()
+        if channel is None:
+            await self.reply(interaction, "No music text channel is set up, so here is the link to share: " + link, ephemeral=True)
+            return
+        embed = discord.Embed(
+            title="Join the Jam",
+            url=link,
+            description=(
+                "Tap the link to join with your own Spotify account, free accounts work too. "
+                "Everyone in the Jam can add songs, skip and pause from their own Spotify app, "
+                "and it all plays here.\n\n" + link
+            ),
+            colour=spotifyGreen,
+        )
+        embed.set_footer(text="Started by " + self.who(interaction))
+        await self.replaceStoredMessage("jamMessage", channel, embed=embed)
+        await self.reply(interaction, "Posted the Jam invite in " + channel.mention + ".", ephemeral=True)
+
+    async def replaceStoredMessage(self, key, channel, **kwargs):
+        # Posts a message and deletes the one it replaces, so invites do not pile up.
+        channelId, _, messageId = (store.getConfig(key) or "").partition(":")
+        old = self.bot.get_channel(int(channelId)) if channelId.isdigit() else None
+        if old is not None and messageId.isdigit():
+            try:
+                await old.get_partial_message(int(messageId)).delete()
+            except discord.HTTPException:
+                pass
+        message = await channel.send(**kwargs)
+        store.setConfig(key, str(channel.id) + ":" + str(message.id))
+        return message
 
     @app_commands.command(name="link", description="Connect your own Spotify account so /play suggests your music")
     async def link(self, interaction: discord.Interaction):
