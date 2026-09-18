@@ -20,6 +20,7 @@ intents = discord.Intents.default()
 # privileged message content intent stays off. when_mentioned is exempt from
 # discord.py's missing intent warning.
 bot = commands.Bot(command_prefix=commands.when_mentioned, intents=intents)
+commandsSynced = False
 
 
 # Loaded as an extension so the music feature stays out of this file. A failure to
@@ -37,16 +38,26 @@ async def on_ready():
     # Global commands can take up to an hour to appear. Setting DISCORD_GUILD_ID syncs
     # to that one server instead, which shows up immediately and is what you want while
     # developing. Leave it unset to publish globally.
+    print(f"Logged in as {bot.user} ({bot.user.id})")
+
+    # on_ready fires again after every reconnect, syncing once per start is enough.
+    global commandsSynced
+    if commandsSynced:
+        return
+    commandsSynced = True
+
     guildId = os.getenv("DISCORD_GUILD_ID", "").strip()
     if guildId:
         guild = discord.Object(id=int(guildId))
         bot.tree.copy_global_to(guild=guild)
         await bot.tree.sync(guild=guild)
-        print(f"Synced commands to guild {guildId}")
+        # Global copies left over from before the guild id was set would show every
+        # command twice, and keep commands that no longer exist, so they are cleared.
+        bot.tree.clear_commands(guild=None)
+        await bot.tree.sync()
+        print(f"Synced commands to guild {guildId} and cleared global commands")
     else:
         await bot.tree.sync()
-
-    print(f"Logged in as {bot.user} ({bot.user.id})")
 
 
 @bot.tree.command(name="gif", description="Send a random gif")
