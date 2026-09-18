@@ -7,7 +7,7 @@ import asyncio
 import logging
 import os
 import time
-from collections import OrderedDict
+from collections import Counter, OrderedDict
 
 import aiohttp
 import discord
@@ -125,6 +125,11 @@ class MusicCog(commands.Cog):
         self.playlistSnapshot = None
         self.playlistBlockedUntil = 0.0
         self.playlistWake = asyncio.Event()
+        self.playlistLock = asyncio.Lock()
+        # Songs from /play waiting to be written to the shared playlist, and the ones
+        # written but not yet seen by the watcher, which must not queue them a second time.
+        self.pendingPlaylistAdds = []
+        self.selfAddedUris = Counter()
 
     async def cog_load(self):
         store.initDb()
@@ -276,21 +281,10 @@ class MusicCog(commands.Cog):
         while True:
             delay = self.playlistPollSeconds if self.voiceClient() else idlePlaylistPollSeconds
             try:
-                await self.checkPlaylist()
-            except spotipy.SpotifyException as err:
-                if err.http_status == 429:
-                    wait = spotifyAuth.retryAfterSeconds(err)
-                    self.playlistBlockedUntil = time.monotonic() + wait
-                    delay = wait
-                    logger.warning(
-                        "Spotify's quota for this app is used up, the shared playlist is checked "
-                        "again in %s. Search keeps working meanwhile.",
-                        catalog.formatMs(wait * 1000),
-                    )
-                else:
-                    logger.warning("Reading the shared playlist failed: %s", err)
-            except (SpotifyOauthError, requests.RequestException) as err:
-                logger.warning("Reading the shared playlist failed: %s", err)
+                async with self.playlistLock:
+                    await self.checkPlaylist()
+            except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException) as err:
+                delay = max(delay, self.notePlaylistError(err))
             except LibrespotError as err:
                 # The song stays after the watermark, so it is queued on the next check.
                 logger.warning("Could not queue a song from the shared playlist: %s", err)
@@ -303,12 +297,60 @@ class MusicCog(commands.Cog):
             except asyncio.TimeoutError:
                 pass
 
+    def notePlaylistError(self, err):
+        # Returns how long to leave the playlist alone.
+        if isinstance(err, spotipy.SpotifyException) and err.http_status == 429:
+            wait = spotifyAuth.retryAfterSeconds(err)
+            self.playlistBlockedUntil = time.monotonic() + wait
+            logger.warning(
+                "Spotify's quota for this app is used up, the shared playlist is left alone for "
+                "%s. Search and playback keep working meanwhile.",
+                catalog.formatMs(wait * 1000),
+            )
+            return wait
+        logger.warning("Shared playlist request failed: %s", err)
+        return 0
+
+    def addToSharedPlaylist(self, uri):
+        self.pendingPlaylistAdds.append(uri)
+        asyncio.create_task(self.flushPlaylistAddsSafely())
+
+    async def flushPlaylistAddsSafely(self):
+        try:
+            async with self.playlistLock:
+                await self.flushPlaylistAdds()
+        except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException) as err:
+            # Left pending, the watcher retries once Spotify allows it again.
+            self.notePlaylistError(err)
+        except Exception:
+            logger.exception("Adding to the shared playlist failed")
+
+    async def flushPlaylistAdds(self):
+        # Caller holds playlistLock.
+        playlistId = spotifyAuth.playlistIdFromEnvOrConfig()
+        if self.sp is None or not playlistId or not self.pendingPlaylistAdds:
+            return
+        if time.monotonic() < self.playlistBlockedUntil:
+            return
+        batch = self.pendingPlaylistAdds[:100]
+        # Counted before the request so a check running right after cannot queue them.
+        self.selfAddedUris.update(batch)
+        try:
+            await self.runBlocking(self.sp.playlist_add_items, playlistId, batch)
+        except Exception:
+            self.selfAddedUris.subtract(batch)
+            raise
+        del self.pendingPlaylistAdds[: len(batch)]
+        logger.info("Added %d song(s) from /play to the shared playlist", len(batch))
+
     async def checkPlaylist(self):
+        # Caller holds playlistLock.
         playlistId = spotifyAuth.playlistIdFromEnvOrConfig()
         if self.sp is None or not playlistId or not self.linked:
             return
         if time.monotonic() < self.playlistBlockedUntil:
             return
+        await self.flushPlaylistAdds()
 
         snapshot = await self.runBlocking(sharedPlaylist.fetchSnapshotId, self.sp, playlistId)
         if snapshot == self.playlistSnapshot:
@@ -318,7 +360,11 @@ class MusicCog(commands.Cog):
         cutoff = sharedPlaylist.stampSecondsAgo(playlistBacklogSeconds)
         watermark = max(store.getConfig("playlistWatermark") or "", cutoff)
         for entry in sharedPlaylist.entriesAddedAfter(entries, watermark):
-            await self.queueFromPlaylist(entry)
+            if self.selfAddedUris[entry["uri"]] > 0:
+                # Came from /play, which has already queued it.
+                self.selfAddedUris[entry["uri"]] -= 1
+            else:
+                await self.queueFromPlaylist(entry)
             store.setConfig("playlistWatermark", entry["addedAt"])
         self.playlistSnapshot = snapshot
 
@@ -615,10 +661,14 @@ class MusicCog(commands.Cog):
 
         if kind in ("track", "episode") and self.playing and not now:
             await self.api.addToQueue(uri)
+            self.addToSharedPlaylist(uri)
             await self.reply(interaction, self.who(interaction) + " queued " + label + ".")
             return
 
         await self.api.play(uri)
+        # Albums and playlists are not copied in, they could be hundreds of songs.
+        if kind in ("track", "episode"):
+            self.addToSharedPlaylist(uri)
         await self.reply(interaction, self.who(interaction) + " started " + label + ".")
 
     @play.autocomplete("query")
