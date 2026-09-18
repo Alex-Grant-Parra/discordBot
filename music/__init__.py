@@ -1,1 +1,1 @@
-# Music feature package. Spotify playlist acts as the shared queue, audio is sourced from YouTube.
+# Music feature package. The bot is a Spotify Connect speaker that plays into Discord voice.

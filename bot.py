@@ -33,7 +33,18 @@ async def setup_hook():
 
 @bot.event
 async def on_ready():
-    await bot.tree.sync()
+    # Global commands can take up to an hour to appear. Setting DISCORD_GUILD_ID syncs
+    # to that one server instead, which shows up immediately and is what you want while
+    # developing. Leave it unset to publish globally.
+    guildId = os.getenv("DISCORD_GUILD_ID", "").strip()
+    if guildId:
+        guild = discord.Object(id=int(guildId))
+        bot.tree.copy_global_to(guild=guild)
+        await bot.tree.sync(guild=guild)
+        print(f"Synced commands to guild {guildId}")
+    else:
+        await bot.tree.sync()
+
     print(f"Logged in as {bot.user} ({bot.user.id})")
 
 
@@ -52,4 +63,5 @@ async def gif(interaction: discord.Interaction):
 if __name__ == "__main__":
     if not TOKEN:
         raise SystemExit("DISCORD_TOKEN is not set. Add it to your .env file.")
-    bot.run(TOKEN)
+    # root_logger makes the music feature's own log lines show up next to discord.py's.
+    bot.run(TOKEN, root_logger=True)
