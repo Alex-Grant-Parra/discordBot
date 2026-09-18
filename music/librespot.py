@@ -220,7 +220,10 @@ class LibrespotApi:
                     raise LibrespotError(
                         "go-librespot answered " + str(resp.status) + " to " + path + ": " + text.strip()
                     )
-                return json.loads(text) if text.strip() else {}
+                # Successful commands answer 200 with a body of null. Only a 204 means
+                # there is no session, so an empty success must not come back as None.
+                data = json.loads(text) if text.strip() else None
+                return {} if data is None else data
         except (aiohttp.ClientError, asyncio.TimeoutError) as err:
             raise LibrespotError("The Spotify speaker is not running or not reachable") from err
 

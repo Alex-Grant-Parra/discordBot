@@ -470,8 +470,8 @@ class MusicCog(commands.Cog):
             message = str(original)
         elif isinstance(original, NotLinkedError):
             message = (
-                "No Spotify account is linked to the speaker yet. The bot's owner needs to "
-                "run python speakerSetup.py."
+                "The speaker is not paired with a Spotify account yet, so nothing can play. "
+                "The pairing link is in the bot's log for the Premium account's owner to approve."
             )
         elif isinstance(original, LibrespotError):
             logger.warning("Speaker command failed: %s", original)
@@ -484,13 +484,13 @@ class MusicCog(commands.Cog):
         except discord.HTTPException:
             logger.exception("Could not report a command error")
 
-    async def requireSpeaker(self):
+    async def requireSpeaker(self, needLinked=True):
         if not self.speakerStarted:
             raise UserFacingError(
                 "The Spotify speaker is not installed. The bot's owner needs to run "
                 "python speakerSetup.py and restart the bot."
             )
-        if self.linked:
+        if self.linked or not needLinked:
             return
         # Every other request would hang until an account is linked.
         if await self.api.authCode():
@@ -562,7 +562,9 @@ class MusicCog(commands.Cog):
 
     @app_commands.command(name="join", description="Bring the Spotify speaker into your voice channel")
     async def join(self, interaction: discord.Interaction):
-        await self.requireSpeaker()
+        # Joining voice works before the speaker is paired, which also makes this a quick
+        # check that the bot's host can reach Discord voice at all.
+        await self.requireSpeaker(needLinked=False)
         channel = userVoiceChannel(interaction)
         if channel is None:
             raise UserFacingError("Join a voice channel first, then run this again.")
@@ -574,11 +576,13 @@ class MusicCog(commands.Cog):
                 "Could not connect to voice within 20 seconds. The usual cause is outbound "
                 "UDP to Discord voice being blocked on the bot's host."
             )
-        await self.reply(
-            interaction,
-            "Joined " + channel.name + ". Pick **" + deviceName() + "** as the device in "
-            "the Spotify app, or use /play.",
-        )
+        message = "Joined " + channel.name + ". Use /play, or add songs to the shared playlist (see /playlist)."
+        if not self.linked:
+            message += (
+                "\nThe speaker is not paired with a Spotify account yet, so nothing can play "
+                "until the Premium account's owner approves the pairing link in the bot's log."
+            )
+        await self.reply(interaction, message)
 
     @app_commands.command(name="leave", description="Stop the music and leave the voice channel")
     async def leave(self, interaction: discord.Interaction):
