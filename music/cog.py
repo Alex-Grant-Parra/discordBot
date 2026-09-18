@@ -40,6 +40,7 @@ defaultIdleSeconds = 300
 maxRememberedLabels = 500
 maxQueueLines = 10
 maxHistory = 50
+jamCheckSeconds = 30
 maxChoices = 25  # Discord's cap on autocomplete suggestions
 
 # The shared playlist is checked often while the bot is in voice and rarely otherwise,
@@ -175,6 +176,7 @@ class MusicCog(commands.Cog):
             asyncio.create_task(self.consumeEvents()),
             asyncio.create_task(self.watchLogin()),
             asyncio.create_task(self.watchPlaylist()),
+            asyncio.create_task(self.watchJam()),
         ]
         self.idleCheck.start()
 
@@ -339,19 +341,14 @@ class MusicCog(commands.Cog):
         if requester:
             embed.set_footer(text="Requested by " + requester)
 
-        channel = self.textChannel()
-        if channel is None:
-            return
         await self.deleteNowPlayingMessage()
         paused = not self.playing
-        try:
-            message = await channel.send(embed=embed, view=PlayerControls(self, paused=paused))
-        except discord.HTTPException:
-            logger.exception("Failed to post the now playing message")
+        message = await self.sendMessage(embed=embed, view=PlayerControls(self, paused=paused))
+        if message is None:
             return
         self.controlsPaused = paused
         # Kept in the database so the message is still cleaned up after a restart.
-        store.setConfig("nowPlayingMessage", str(channel.id) + ":" + str(message.id))
+        store.setConfig("nowPlayingMessage", str(message.channel.id) + ":" + str(message.id))
 
     def nowPlayingMessage(self):
         channelId, _, messageId = (store.getConfig("nowPlayingMessage") or "").partition(":")
@@ -624,25 +621,39 @@ class MusicCog(commands.Cog):
 
     # Messages
 
-    def textChannel(self):
-        channelId = envChannelId("MUSIC_TEXT_CHANNEL_ID")
-        if not channelId:
-            return None
-        channel = self.bot.get_channel(channelId)
-        if channel is None:
-            logger.warning("Text channel %d is not visible to the bot", channelId)
-        return channel
+    async def interaction_check(self, interaction):
+        # Remembers where music commands are being used, so the bot talks there.
+        if interaction.guild_id and interaction.channel_id:
+            if store.getConfig("textChannelId") != str(interaction.channel_id):
+                store.setConfig("textChannelId", interaction.channel_id)
+        return True
+
+    def textChannels(self):
+        # The channel a music command was last run from, then the configured music
+        # channel as a fallback for before anyone has run one or when posting fails.
+        channels = []
+        stored = store.getConfig("textChannelId") or ""
+        for channelId in (int(stored) if stored.isdigit() else 0, envChannelId("MUSIC_TEXT_CHANNEL_ID")):
+            channel = self.bot.get_channel(channelId) if channelId else None
+            if channel is not None and channel not in channels:
+                channels.append(channel)
+        return channels
+
+    async def sendMessage(self, **kwargs):
+        # Returns the posted message, or None when no channel would take it.
+        for channel in self.textChannels():
+            try:
+                return await channel.send(**kwargs)
+            except (discord.Forbidden, discord.NotFound):
+                logger.warning("Cannot post in #%s, trying the next channel", getattr(channel, "name", channel.id))
+            except discord.HTTPException:
+                logger.exception("Failed to post a message to #%s", getattr(channel, "name", channel.id))
+                return None
+        logger.info("No channel to post in, message not posted: %s", kwargs.get("content") or "an embed")
+        return None
 
     async def notify(self, message=None, embed=None):
-        channel = self.textChannel()
-        if channel is None:
-            if message:
-                logger.info("No text channel available, message not posted: %s", message)
-            return
-        try:
-            await channel.send(content=message, embed=embed)
-        except discord.HTTPException:
-            logger.exception("Failed to post a message to channel %d", channel.id)
+        await self.sendMessage(content=message, embed=embed)
 
     async def reply(self, interaction, message=None, embed=None, ephemeral=False, view=None):
         kwargs = {"ephemeral": ephemeral}
@@ -1061,10 +1072,6 @@ class MusicCog(commands.Cog):
         guests = sum(1 for member in session.get("session_members") or [] if not member.get("is_current_user"))
         logger.info("Jam invite posted by %s, %d guest(s) already in it", self.who(interaction), guests)
 
-        channel = self.textChannel()
-        if channel is None:
-            await self.reply(interaction, "No music text channel is set up, so here is the link to share: " + link, ephemeral=True)
-            return
         embed = discord.Embed(
             title="Join the Jam",
             url=link,
@@ -1076,21 +1083,52 @@ class MusicCog(commands.Cog):
             colour=spotifyGreen,
         )
         embed.set_footer(text="Started by " + self.who(interaction))
-        await self.replaceStoredMessage("jamMessage", channel, embed=embed)
-        await self.reply(interaction, "Posted the Jam invite in " + channel.mention + ".", ephemeral=True)
+        message = await self.replaceStoredMessage("jamMessage", embed=embed)
+        store.setConfig("jamSessionId", session.get("session_id") or "")
+        if message is None:
+            await self.reply(interaction, "I could not post in this channel, so here is the link to share: " + link, ephemeral=True)
+            return
+        await self.reply(interaction, "Posted the Jam invite in " + message.channel.mention + ".", ephemeral=True)
 
-    async def replaceStoredMessage(self, key, channel, **kwargs):
-        # Posts a message and deletes the one it replaces, so invites do not pile up.
+    async def deleteStoredMessage(self, key):
         channelId, _, messageId = (store.getConfig(key) or "").partition(":")
+        store.setConfig(key, "")
         old = self.bot.get_channel(int(channelId)) if channelId.isdigit() else None
         if old is not None and messageId.isdigit():
             try:
                 await old.get_partial_message(int(messageId)).delete()
             except discord.HTTPException:
                 pass
-        message = await channel.send(**kwargs)
-        store.setConfig(key, str(channel.id) + ":" + str(message.id))
+
+    async def replaceStoredMessage(self, key, **kwargs):
+        # Posts a message and deletes the one it replaces, so invites do not pile up.
+        await self.deleteStoredMessage(key)
+        message = await self.sendMessage(**kwargs)
+        if message is not None:
+            store.setConfig(key, str(message.channel.id) + ":" + str(message.id))
         return message
+
+    async def watchJam(self):
+        # Deletes the Jam invite once that Jam has ended, however it ended.
+        await self.bot.wait_until_ready()
+        while True:
+            await asyncio.sleep(jamCheckSeconds)
+            if not store.getConfig("jamMessage") or not self.linked:
+                continue
+            try:
+                current = await self.api.currentJam()
+            except LibrespotError as err:
+                logger.debug("Could not check the Jam: %s", err)
+                continue
+            postedId = store.getConfig("jamSessionId")
+            if current is not None and not postedId:
+                # Invite posted before the Jam id was being recorded.
+                store.setConfig("jamSessionId", current["session_id"])
+                continue
+            if current is None or current["session_id"] != postedId:
+                logger.info("The Jam ended, deleting its invite")
+                await self.deleteStoredMessage("jamMessage")
+                store.setConfig("jamSessionId", "")
 
     @app_commands.command(name="link", description="Connect your own Spotify account so /play suggests your music")
     async def link(self, interaction: discord.Interaction):
@@ -1188,8 +1226,7 @@ class MusicCog(commands.Cog):
 
     async def cleanUpAfterLeaving(self, channel, onPurpose):
         self.idleSince = None
-        wasPlaying = self.playing
-        if wasPlaying:
+        if self.playing:
             try:
                 await self.api.pause()
             except LibrespotError:
@@ -1198,12 +1235,6 @@ class MusicCog(commands.Cog):
         self.lastAnnouncedUri = None
         self.controlsPaused = None
         logger.info("Left voice channel %s (%s)", channel.name, "on purpose" if onPurpose else "disconnected by someone")
-        if not onPurpose:
-            await self.notify(
-                "Someone disconnected me from " + channel.name
-                + (", so I paused the music." if wasPlaying else ".")
-                + " Use /join or play from Spotify to bring me back."
-            )
 
     @idleCheck.before_loop
     async def beforeIdleCheck(self):

@@ -32,6 +32,7 @@ webApiQueueUrl = "https://api.spotify.com/v1/me/player/queue"
 # apps use it, so it can change without notice.
 jamSessionUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/current_or_new"
 jamInviteUrl = "https://open.spotify.com/socialsession/"
+jamCurrentUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/current"
 
 
 class LibrespotError(RuntimeError):
@@ -322,6 +323,28 @@ class LibrespotApi:
         if not session.get("join_session_token"):
             logger.warning("Jam response had no invite code: %s", sorted(session))
             raise LibrespotError("Spotify did not return an invite link for the Jam")
+        return session
+
+    async def currentJam(self):
+        # The Jam running on the speaker's account, or None when there is none. Raises on
+        # anything unclear, so a hiccup is never mistaken for the Jam having ended.
+        token = await self.accessToken()
+        if not token:
+            raise NotLinkedError()
+        try:
+            async with self.session.get(
+                jamCurrentUrl, headers={"Authorization": "Bearer " + token}, timeout=requestTimeout
+            ) as resp:
+                text = await resp.text()
+                if resp.status in (204, 404):
+                    return None
+                if resp.status != 200:
+                    raise LibrespotError("Spotify answered " + str(resp.status) + " when checking the Jam")
+                session = json.loads(text) if text.strip() else {}
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            raise LibrespotError("Could not reach Spotify to check the Jam") from err
+        if not session.get("session_id") or session.get("active") is False:
+            return None
         return session
 
     async def upcomingTracks(self):
