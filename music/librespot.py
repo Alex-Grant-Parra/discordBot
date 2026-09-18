@@ -255,11 +255,16 @@ class LibrespotApi:
     async def resume(self):
         await self.command("/player/resume")
 
+    async def playPause(self):
+        await self.command("/player/playpause")
+
     async def next(self):
         await self.command("/player/next")
 
-    async def prev(self):
-        await self.command("/player/prev")
+    async def skipTo(self, uri):
+        # Plays uri straight away. Anything queued stays queued and plays after it, even
+        # when uri is not part of the current album or playlist.
+        await self.command("/player/next", {"uri": uri})
 
     async def seek(self, positionMs):
         await self.command("/player/seek", {"position": int(positionMs)})
