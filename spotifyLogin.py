@@ -128,7 +128,8 @@ def main():
     if not playlist["collaborative"]:
         print("Warning: the playlist is not collaborative, so nobody else can add songs from Spotify.")
 
-    print("Share that link. Anyone who opens it in Spotify while logged in can edit the queue.")
+    print("Use /playlist in Discord to play it. To let people add songs from their own Spotify")
+    print("accounts, open it in the Spotify app and send them an Invite collaborators link.")
 
 
 if __name__ == "__main__":

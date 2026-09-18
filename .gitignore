@@ -5,3 +5,4 @@ __pycache__/
 *.pyc
 music.db
 music.db-journal
+librespot/
