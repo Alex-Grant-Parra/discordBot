@@ -28,6 +28,10 @@ fifoPath = baseDir / "audio.fifo"
 
 requestTimeout = aiohttp.ClientTimeout(total=15)
 webApiQueueUrl = "https://api.spotify.com/v1/me/player/queue"
+# Spotify's own service behind Jams. It is not part of the public Web API, the Spotify
+# apps use it, so it can change without notice.
+jamSessionUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/current_or_new"
+jamInviteUrl = "https://open.spotify.com/socialsession/"
 
 
 class LibrespotError(RuntimeError):
@@ -290,11 +294,39 @@ class LibrespotApi:
     async def addToQueue(self, uri):
         await self.command("/player/add_to_queue", {"uri": uri})
 
-    async def upcomingTracks(self):
-        # go-librespot only knows the next track, so the full queue comes from the Web API
-        # using the speaker's own session token, which is always the right account.
+    async def accessToken(self):
+        # The speaker's own session token, so always for the speaker's account.
         tokenInfo = await self.request("POST", "/token")
-        token = (tokenInfo or {}).get("token")
+        return (tokenInfo or {}).get("token")
+
+    async def currentOrNewJam(self, deviceId):
+        # Returns the Jam running on the speaker's account, starting one hosted on the
+        # speaker if there is none. Started on a speaker it is an in person Jam, the same
+        # kind the Spotify app makes when you start a Jam while casting to one.
+        token = await self.accessToken()
+        if not token:
+            raise NotLinkedError()
+        try:
+            async with self.session.get(
+                jamSessionUrl,
+                params={"local_device_id": deviceId, "type": "IN_PERSON"},
+                headers={"Authorization": "Bearer " + token},
+                timeout=requestTimeout,
+            ) as resp:
+                text = await resp.text()
+                if resp.status != 200:
+                    raise LibrespotError("Spotify answered " + str(resp.status) + " when starting the Jam")
+                session = json.loads(text)
+        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError) as err:
+            raise LibrespotError("Could not reach Spotify to start the Jam") from err
+        if not session.get("join_session_token"):
+            logger.warning("Jam response had no invite code: %s", sorted(session))
+            raise LibrespotError("Spotify did not return an invite link for the Jam")
+        return session
+
+    async def upcomingTracks(self):
+        # go-librespot only knows the next track, so the full queue comes from the Web API.
+        token = await self.accessToken()
         if not token:
             return None
         try:
