@@ -1,4 +1,5 @@
-# SQLite persistence for the music feature. Holds the Spotify Web API token and feature config.
+# SQLite persistence for the music feature. Holds the bot's Spotify Web API token, the
+# personal Spotify logins people link with /link, and feature config.
 
 import json
 import os
@@ -18,6 +19,14 @@ CREATE TABLE IF NOT EXISTS config (
 CREATE TABLE IF NOT EXISTS spotifyToken (
     id INTEGER PRIMARY KEY CHECK (id = 1),
     tokenJson TEXT NOT NULL,
+    updatedAt TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS userSpotifyToken (
+    discordUserId TEXT PRIMARY KEY,
+    tokenJson TEXT NOT NULL,
+    spotifyUserId TEXT,
+    displayName TEXT,
     updatedAt TEXT NOT NULL
 );
 """
@@ -109,3 +118,59 @@ def clearToken():
     with connect() as conn:
         conn.execute("DELETE FROM spotifyToken WHERE id = 1")
 
+
+# Personal Spotify logins, one per Discord user.
+
+def loadUserToken(discordUserId):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT tokenJson FROM userSpotifyToken WHERE discordUserId = ?", (str(discordUserId),)
+        ).fetchone()
+    if row is None:
+        return None
+    try:
+        return json.loads(row["tokenJson"])
+    except (ValueError, TypeError):
+        return None
+
+
+def saveUserToken(discordUserId, tokenInfo):
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO userSpotifyToken (discordUserId, tokenJson, updatedAt) VALUES (?, ?, ?) "
+            "ON CONFLICT(discordUserId) DO UPDATE SET tokenJson = excluded.tokenJson, "
+            "updatedAt = excluded.updatedAt",
+            (str(discordUserId), json.dumps(tokenInfo), nowStamp()),
+        )
+
+
+def saveUserProfile(discordUserId, spotifyUserId, displayName):
+    with connect() as conn:
+        conn.execute(
+            "UPDATE userSpotifyToken SET spotifyUserId = ?, displayName = ? WHERE discordUserId = ?",
+            (spotifyUserId, displayName, str(discordUserId)),
+        )
+
+
+def loadUserProfile(discordUserId):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT spotifyUserId, displayName FROM userSpotifyToken WHERE discordUserId = ?",
+            (str(discordUserId),),
+        ).fetchone()
+    if row is None:
+        return None
+    return {"spotifyUserId": row["spotifyUserId"], "displayName": row["displayName"]}
+
+
+def deleteUserToken(discordUserId):
+    with connect() as conn:
+        conn.execute("DELETE FROM userSpotifyToken WHERE discordUserId = ?", (str(discordUserId),))
+
+
+def findDiscordUserBySpotifyId(spotifyUserId):
+    with connect() as conn:
+        row = conn.execute(
+            "SELECT discordUserId FROM userSpotifyToken WHERE spotifyUserId = ?", (spotifyUserId,)
+        ).fetchone()
+    return row["discordUserId"] if row else None
