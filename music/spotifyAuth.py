@@ -26,6 +26,25 @@ defaultPlaylistName = "Discord Queue"
 defaultPlaylistDescription = "Shared queue for the Discord music bot. Add songs here and the bot will play them."
 
 
+# spotipy normally sleeps through a 429 before retrying, and Development Mode quota errors
+# carry a Retry-After of many hours, which would hang the calling thread for that long.
+# urllib3 honours Retry-After whenever any retry is allowed, so retries are off entirely
+# and a 429 raises at once for the caller to back off.
+clientOptions = {
+    "requests_timeout": 10,
+    "retries": 0,
+    "status_retries": 0,
+    "status_forcelist": (500, 502, 503, 504),
+}
+
+
+def retryAfterSeconds(err, default=60):
+    try:
+        return max(default, int((err.headers or {}).get("Retry-After", default)))
+    except (TypeError, ValueError):
+        return default
+
+
 class SpotifyConfigError(RuntimeError):
     # Raised when the .env values needed for Spotify are missing or malformed.
     pass
@@ -104,7 +123,7 @@ def getSpotifyClient():
             "The stored Spotify token is missing required scopes. "
             "Run python spotifyLogin.py again to re authorize."
         )
-    return spotipy.Spotify(auth_manager=buildOauth(openBrowser=False))
+    return spotipy.Spotify(auth_manager=buildOauth(openBrowser=False), **clientOptions)
 
 
 def playlistIdFromEnvOrConfig():

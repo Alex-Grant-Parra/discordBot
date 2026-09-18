@@ -11,12 +11,15 @@ from collections import OrderedDict
 
 import aiohttp
 import discord
+import requests
 import spotipy
 from discord import app_commands
 from discord.ext import commands, tasks
+from spotipy.oauth2 import SpotifyOauthError
 
-from . import catalog, spotifyAuth, store
+from . import catalog, sharedPlaylist, spotifyAuth, store
 from .audioBridge import AudioBridge, BridgeSource
+from .userAccounts import LinkError, UserAccounts
 from .librespot import (
     LibrespotApi,
     LibrespotError,
@@ -34,6 +37,14 @@ spotifyGreen = discord.Colour.from_rgb(30, 215, 96)
 defaultIdleSeconds = 300
 maxRememberedLabels = 500
 maxQueueLines = 10
+maxChoices = 25  # Discord's cap on autocomplete suggestions
+
+# The shared playlist is checked often while the bot is in voice and rarely otherwise,
+# because every check counts against the Spotify app's Development Mode quota.
+defaultPlaylistPollSeconds = 30
+idlePlaylistPollSeconds = 300
+# Songs added while the bot was offline longer than this are not queued on its return.
+playlistBacklogSeconds = 12 * 3600
 
 
 class UserFacingError(Exception):
@@ -47,6 +58,14 @@ def readIdleSeconds():
     except ValueError:
         return defaultIdleSeconds
     return max(30, value)
+
+
+def readPlaylistPollSeconds():
+    try:
+        value = int(os.getenv("MUSIC_POLL_SECONDS", str(defaultPlaylistPollSeconds)))
+    except ValueError:
+        return defaultPlaylistPollSeconds
+    return max(15, min(idlePlaylistPollSeconds, value))
 
 
 def envChannelId(name):
@@ -99,6 +118,13 @@ class MusicCog(commands.Cog):
         # Autocomplete hands back only a URI, this keeps the matching song name so the
         # reply can say what was played.
         self.labels = OrderedDict()
+        # Who asked for each song, shown when it starts and in /queue.
+        self.requestedBy = OrderedDict()
+        self.accounts = UserAccounts()
+        self.playlistPollSeconds = readPlaylistPollSeconds()
+        self.playlistSnapshot = None
+        self.playlistBlockedUntil = 0.0
+        self.playlistWake = asyncio.Event()
 
     async def cog_load(self):
         store.initDb()
@@ -112,12 +138,17 @@ class MusicCog(commands.Cog):
             )
             return
 
+        # Songs already in the shared playlist the first time this runs are not new.
+        if not store.getConfig("playlistWatermark"):
+            store.setConfig("playlistWatermark", sharedPlaylist.nowStamp())
+
         self.bridge.start()
         self.process.start()
         self.speakerStarted = True
         self.backgroundTasks = [
             asyncio.create_task(self.consumeEvents()),
             asyncio.create_task(self.watchLogin()),
+            asyncio.create_task(self.watchPlaylist()),
         ]
         self.idleCheck.start()
 
@@ -211,7 +242,11 @@ class MusicCog(commands.Cog):
         if not uri or uri == self.lastAnnouncedUri:
             return
         self.lastAnnouncedUri = uri
-        await self.notify(embed=self.trackEmbed(track, "Now playing"))
+        embed = self.trackEmbed(track, "Now playing")
+        requester = self.requestedBy.pop(uri, None)
+        if requester:
+            embed.set_footer(text="Requested by " + requester)
+        await self.notify(embed=embed)
 
     def trackEmbed(self, track, heading, showPosition=False):
         embed = discord.Embed(
@@ -233,6 +268,91 @@ class MusicCog(commands.Cog):
         if track.get("album_cover_url"):
             embed.set_thumbnail(url=track["album_cover_url"])
         return embed
+
+    # Shared playlist
+
+    async def watchPlaylist(self):
+        await self.bot.wait_until_ready()
+        while True:
+            delay = self.playlistPollSeconds if self.voiceClient() else idlePlaylistPollSeconds
+            try:
+                await self.checkPlaylist()
+            except spotipy.SpotifyException as err:
+                if err.http_status == 429:
+                    wait = spotifyAuth.retryAfterSeconds(err)
+                    self.playlistBlockedUntil = time.monotonic() + wait
+                    delay = wait
+                    logger.warning(
+                        "Spotify's quota for this app is used up, the shared playlist is checked "
+                        "again in %s. Search keeps working meanwhile.",
+                        catalog.formatMs(wait * 1000),
+                    )
+                else:
+                    logger.warning("Reading the shared playlist failed: %s", err)
+            except (SpotifyOauthError, requests.RequestException) as err:
+                logger.warning("Reading the shared playlist failed: %s", err)
+            except LibrespotError as err:
+                # The song stays after the watermark, so it is queued on the next check.
+                logger.warning("Could not queue a song from the shared playlist: %s", err)
+            except Exception:
+                logger.exception("Checking the shared playlist failed")
+
+            self.playlistWake.clear()
+            try:
+                await asyncio.wait_for(self.playlistWake.wait(), timeout=delay)
+            except asyncio.TimeoutError:
+                pass
+
+    async def checkPlaylist(self):
+        playlistId = spotifyAuth.playlistIdFromEnvOrConfig()
+        if self.sp is None or not playlistId or not self.linked:
+            return
+        if time.monotonic() < self.playlistBlockedUntil:
+            return
+
+        snapshot = await self.runBlocking(sharedPlaylist.fetchSnapshotId, self.sp, playlistId)
+        if snapshot == self.playlistSnapshot:
+            return
+        entries = await self.runBlocking(sharedPlaylist.fetchEntries, self.sp, playlistId)
+
+        cutoff = sharedPlaylist.stampSecondsAgo(playlistBacklogSeconds)
+        watermark = max(store.getConfig("playlistWatermark") or "", cutoff)
+        for entry in sharedPlaylist.entriesAddedAfter(entries, watermark):
+            await self.queueFromPlaylist(entry)
+            store.setConfig("playlistWatermark", entry["addedAt"])
+        self.playlistSnapshot = snapshot
+
+    async def queueFromPlaylist(self, entry):
+        uri, label = entry["uri"], entry["label"]
+        name = await self.discordNameForSpotifyUser(entry["addedBy"])
+        self.rememberLabel(uri, label)
+        if name:
+            self.rememberRequester(uri, name)
+
+        # Paused music stays paused, the song just waits in the queue.
+        status = await self.api.status()
+        if status and status.get("track") and not status.get("stopped"):
+            await self.api.addToQueue(uri)
+            outcome = "it is in the queue."
+        else:
+            await self.api.play(uri)
+            outcome = "playing it now."
+        logger.info("Shared playlist: %s added %s", name or "a collaborator", label)
+        await self.notify((name or "Someone") + " added " + label + " from Spotify, " + outcome)
+
+    async def discordNameForSpotifyUser(self, spotifyUserId):
+        # Only people who used /link can be named, Spotify no longer lets apps look up
+        # other users' profiles.
+        discordUserId = store.findDiscordUserBySpotifyId(spotifyUserId) if spotifyUserId else None
+        if not discordUserId:
+            return None
+        user = self.bot.get_user(int(discordUserId))
+        if user is None:
+            try:
+                user = await self.bot.fetch_user(int(discordUserId))
+            except discord.HTTPException:
+                return None
+        return user.display_name
 
     # Voice
 
@@ -287,6 +407,7 @@ class MusicCog(commands.Cog):
 
             store.setConfig("voiceChannelId", channel.id)
             self.warnedNoChannel = False
+            self.playlistWake.set()
             self.idleSince = None
 
             if not vc.is_playing() and not vc.is_paused():
@@ -330,12 +451,14 @@ class MusicCog(commands.Cog):
         except discord.HTTPException:
             logger.exception("Failed to post a message to channel %d", channelId)
 
-    async def reply(self, interaction, message=None, embed=None, ephemeral=False):
+    async def reply(self, interaction, message=None, embed=None, ephemeral=False, view=None):
         kwargs = {"ephemeral": ephemeral}
         if message is not None:
             kwargs["content"] = message
         if embed is not None:
             kwargs["embed"] = embed
+        if view is not None:
+            kwargs["view"] = view
         if interaction.response.is_done():
             await interaction.followup.send(**kwargs)
         else:
@@ -385,25 +508,52 @@ class MusicCog(commands.Cog):
         while len(self.labels) > maxRememberedLabels:
             self.labels.popitem(last=False)
 
-    async def searchTracks(self, query, limit=catalog.searchLimit):
-        try:
-            return await self.runBlocking(catalog.searchTracks, self.sp, query, limit)
-        except spotipy.SpotifyException as err:
-            logger.warning("Spotify search failed: %s", err)
-            raise UserFacingError("Spotify search failed, try again or paste a Spotify link.")
+    def rememberRequester(self, uri, name):
+        self.requestedBy[uri] = name
+        self.requestedBy.move_to_end(uri)
+        while len(self.requestedBy) > maxRememberedLabels:
+            self.requestedBy.popitem(last=False)
 
-    async def resolve(self, query):
+    async def searchTracks(self, query, limit=catalog.searchLimit, userId=None):
+        # Searches as the person's own linked account when there is one, so results
+        # follow their country and taste, falling back to the bot's login.
+        personal = self.accounts.client(userId) if userId else None
+        clients = [sp for sp in (personal, self.sp) if sp is not None]
+        if not clients:
+            raise UserFacingError(
+                "Searching by name needs a Spotify login. Use /link to connect your own "
+                "Spotify account, free is fine, or paste a Spotify link."
+            )
+        for sp in clients:
+            try:
+                return await self.runBlocking(catalog.searchTracks, sp, query, limit)
+            except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException) as err:
+                logger.warning("Spotify search failed: %s", err)
+        raise UserFacingError("Spotify search failed, try again or paste a Spotify link.")
+
+    async def personalMatches(self, userId, query):
+        # Songs from the person's own recently played, top and liked lists whose name
+        # contains what they typed, or all of them when nothing is typed yet.
+        try:
+            tracks = await self.runBlocking(self.accounts.library, userId)
+        except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException):
+            logger.exception("Could not read the linked Spotify library of %s", userId)
+            return []
+        lowered = query.lower()
+        return [track for track in tracks if lowered in track["label"].lower()]
+
+    async def resolve(self, query, userId):
         reference = catalog.parseReference(query)
         if reference is not None:
             kind, uri = reference
             return kind, uri, self.labels.get(uri) or "that " + kind
 
-        if self.sp is None:
-            raise UserFacingError(
-                "Searching by name needs the Spotify Web API login (python spotifyLogin.py). "
-                "Paste a Spotify link instead."
-            )
-        results = await self.searchTracks(query, 1)
+        # Typed without picking a suggestion. Prefer the person's own music, the same
+        # order the suggestions list shows.
+        personal = await self.personalMatches(userId, query.strip())
+        if personal:
+            return "track", personal[0]["uri"], personal[0]["label"]
+        results = await self.searchTracks(query, 1, userId)
         if not results:
             raise UserFacingError("Nothing on Spotify matched " + query + ".")
         return "track", results[0]["uri"], results[0]["label"]
@@ -454,8 +604,10 @@ class MusicCog(commands.Cog):
     async def play(self, interaction: discord.Interaction, query: str, now: bool = False):
         await self.requireSpeaker()
         await interaction.response.defer()
-        kind, uri, label = await self.resolve(query)
+        kind, uri, label = await self.resolve(query, interaction.user.id)
         await self.connectForCommand(interaction)
+        if kind in ("track", "episode"):
+            self.rememberRequester(uri, self.who(interaction))
 
         if kind in ("track", "episode") and self.playing and not now:
             await self.api.addToQueue(uri)
@@ -468,17 +620,32 @@ class MusicCog(commands.Cog):
     @play.autocomplete("query")
     async def queryAutocomplete(self, interaction: discord.Interaction, current: str):
         current = current.strip()
-        if len(current) < 2 or self.sp is None or catalog.parseReference(current):
+        if catalog.parseReference(current):
             return []
         try:
-            # Discord drops autocomplete answers that take longer than 3 seconds.
-            results = await asyncio.wait_for(self.searchTracks(current), timeout=2.5)
+            # Discord drops autocomplete answers that take longer than 3 seconds. A slow
+            # first library fetch still finishes in the background and fills the cache.
+            return await asyncio.wait_for(self.suggest(interaction.user.id, current), timeout=2.5)
         except (asyncio.TimeoutError, UserFacingError):
             return []
+        except Exception:
+            logger.exception("Building /play suggestions failed")
+            return []
+
+    async def suggest(self, userId, current):
+        suggestions = await self.personalMatches(userId, current)
+        if len(current) >= 2:
+            seen = {track["uri"] for track in suggestions}
+            results = await self.searchTracks(current, userId=userId)
+            suggestions += [result for result in results if result["uri"] not in seen]
+
         choices = []
-        for result in results:
-            self.rememberLabel(result["uri"], result["label"])
-            choices.append(app_commands.Choice(name=result["label"][:100], value=result["uri"]))
+        for track in suggestions[:maxChoices]:
+            self.rememberLabel(track["uri"], track["label"])
+            name = track["label"]
+            if track.get("source"):
+                name += " · " + track["source"]
+            choices.append(app_commands.Choice(name=name[:100], value=track["uri"]))
         return choices
 
     @app_commands.command(name="pause", description="Pause the music")
@@ -599,7 +766,10 @@ class MusicCog(commands.Cog):
             lines.append("")
             lines.append("Up next:")
             for position, item in enumerate(upcoming[:maxQueueLines], start=1):
-                lines.append(str(position) + ". " + webApiTrackLabel(item))
+                line = str(position) + ". " + webApiTrackLabel(item)
+                if item.get("uri") in self.requestedBy:
+                    line += " (added by " + self.requestedBy[item["uri"]] + ")"
+                lines.append(line)
             if len(upcoming) > maxQueueLines:
                 lines.append("...and " + str(len(upcoming) - maxQueueLines) + " more")
         elif status.get("next_track"):
@@ -608,21 +778,30 @@ class MusicCog(commands.Cog):
             lines.append("Nothing queued after this.")
         await self.reply(interaction, "\n".join(lines))
 
-    @app_commands.command(name="playlist", description="Play the shared Spotify playlist")
-    async def playlist(self, interaction: discord.Interaction):
-        await self.requireSpeaker()
+    @app_commands.command(name="playlist", description="Add songs from your own Spotify app through the shared playlist")
+    @app_commands.describe(play_all="Also play everything in the playlist from the start")
+    async def playlist(self, interaction: discord.Interaction, play_all: bool = False):
         playlistId = spotifyAuth.playlistIdFromEnvOrConfig()
         if not playlistId:
             raise UserFacingError("No shared playlist is set up. The bot's owner can create one with python spotifyLogin.py.")
+        link = "https://open.spotify.com/playlist/" + playlistId
+        howTo = (
+            "Add songs to the shared playlist from your own Spotify app, free accounts too, and "
+            "I queue them here: " + link + "\n"
+            "You need to be a collaborator first. Ask the playlist's owner to send you an "
+            "**Invite collaborators** link from the playlist in Spotify."
+        )
+        if not play_all:
+            await self.reply(interaction, howTo)
+            return
+
+        await self.requireSpeaker()
         await interaction.response.defer()
         await self.connectForCommand(interaction)
         await self.api.play("spotify:playlist:" + playlistId)
-        await self.reply(
-            interaction,
-            self.who(interaction) + " started the shared playlist: https://open.spotify.com/playlist/" + playlistId,
-        )
+        await self.reply(interaction, self.who(interaction) + " started the whole shared playlist.\n\n" + howTo)
 
-    @app_commands.command(name="speaker", description="How to control the music from the Spotify app")
+    @app_commands.command(name="speaker", description="How to use the music bot")
     async def speaker(self, interaction: discord.Interaction):
         await self.requireSpeaker()
         status = await self.api.status()
@@ -634,21 +813,81 @@ class MusicCog(commands.Cog):
             state = "paused" if status.get("paused") else "playing"
         else:
             state = "idle"
+        # Deliberately never shows which account the speaker uses, it belongs to one person.
         embed = discord.Embed(title=status.get("device_name") or deviceName(), colour=spotifyGreen)
-        embed.add_field(name="Spotify account", value=status.get("username") or "unknown")
         embed.add_field(name="State", value=state)
         embed.add_field(name="Voice channel", value=vc.channel.mention if vc else "not connected")
         embed.add_field(
-            name="Controlling it from Spotify",
+            name="From your Spotify app",
+            value="Add songs to the shared playlist and they are queued here. Run /playlist for the link.",
+            inline=False,
+        )
+        embed.add_field(
+            name="From Discord",
+            value="/play, /pause, /resume, /skip, /previous, /seek, /volume, /shuffle, /repeat, /queue, /nowplaying",
+            inline=False,
+        )
+        embed.add_field(
+            name="Your own account",
             value=(
-                "1. Log in to the Spotify app with the account above.\n"
-                "2. Tap the devices icon and pick **" + (status.get("device_name") or deviceName()) + "**.\n"
-                "3. Play, pause, skip, change volume and add to queue as normal. "
-                "Everyone logged in to that account can control it at the same time."
+                "Run /link to connect your own Spotify account, free is fine. /play then suggests "
+                "your recently played, top and liked songs, and your name shows when you add "
+                "songs to the shared playlist."
             ),
             inline=False,
         )
         await self.reply(interaction, embed=embed, ephemeral=True)
+
+    @app_commands.command(name="link", description="Connect your own Spotify account so /play suggests your music")
+    async def link(self, interaction: discord.Interaction):
+        try:
+            url = self.accounts.startLink(interaction.user.id)
+            redirectUri = spotifyAuth.readSpotifyEnv()[2]
+        except spotifyAuth.SpotifyConfigError:
+            raise UserFacingError("Spotify is not configured on the bot, ask its owner to check the .env file.")
+
+        profile = store.loadUserProfile(interaction.user.id)
+        intro = ""
+        if profile:
+            intro = "You are linked as **" + (profile.get("displayName") or "a Spotify account") + "**. Linking again replaces it.\n\n"
+        await self.reply(
+            interaction,
+            intro
+            + "1. Press **Log in to Spotify** and approve. Any Spotify account works, Premium is not needed.\n"
+            "2. Your browser then opens a page that fails to load. That is expected.\n"
+            "3. Copy that page's whole address, press **Paste the address** and paste it in.\n\n"
+            "Your account is only read, to suggest your music in /play and to show your name when you "
+            "add songs to the shared playlist. Songs still play on the shared speaker.",
+            ephemeral=True,
+            view=LinkView(self, url, redirectUri),
+        )
+
+    @app_commands.command(name="unlink", description="Disconnect your Spotify account from the bot")
+    async def unlink(self, interaction: discord.Interaction):
+        profile = self.accounts.unlink(interaction.user.id)
+        if profile is None:
+            raise UserFacingError("You do not have a Spotify account linked.")
+        await self.reply(
+            interaction,
+            "Unlinked **" + (profile.get("displayName") or "your Spotify account") + "**. To also remove "
+            "the bot from your Spotify account, visit spotify.com/account/apps.",
+            ephemeral=True,
+        )
+
+    async def completeLink(self, interaction, pastedUrl):
+        await interaction.response.defer(ephemeral=True, thinking=True)
+        userId = interaction.user.id
+        try:
+            displayName = await self.runBlocking(self.accounts.finishLink, userId, pastedUrl)
+        except LinkError as err:
+            await interaction.followup.send(str(err), ephemeral=True)
+            return
+        # Warms the library cache so the first /play already has suggestions.
+        asyncio.create_task(self.personalMatches(userId, ""))
+        await interaction.followup.send(
+            "Linked as **" + displayName + "**. /play now suggests your recently played, top and liked songs.",
+            ephemeral=True,
+        )
 
     # Leaves when nobody is listening, or when nothing has played for a while
 
@@ -684,6 +923,45 @@ class MusicCog(commands.Cog):
     @idleCheck.before_loop
     async def beforeIdleCheck(self):
         await self.bot.wait_until_ready()
+
+
+class LinkView(discord.ui.View):
+    def __init__(self, cog, url, redirectUri):
+        super().__init__(timeout=15 * 60)
+        self.cog = cog
+        self.redirectUri = redirectUri
+        # Rebuilt so the login button comes before the decorated paste button.
+        paste = self.paste
+        self.clear_items()
+        self.add_item(discord.ui.Button(label="Log in to Spotify", style=discord.ButtonStyle.link, url=url))
+        self.add_item(paste)
+
+    @discord.ui.button(label="Paste the address", style=discord.ButtonStyle.primary)
+    async def paste(self, interaction: discord.Interaction, button: discord.ui.Button):
+        await interaction.response.send_modal(LinkModal(self.cog, self.redirectUri))
+
+
+class LinkModal(discord.ui.Modal, title="Finish linking Spotify"):
+    def __init__(self, cog, redirectUri):
+        super().__init__()
+        self.cog = cog
+        self.address = discord.ui.TextInput(
+            label="Address of the page that failed to load",
+            placeholder=(redirectUri + "?code=...")[:100],
+            max_length=2000,
+        )
+        self.add_item(self.address)
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await self.cog.completeLink(interaction, self.address.value)
+
+    async def on_error(self, interaction: discord.Interaction, error: Exception):
+        logger.exception("Linking a Spotify account failed", exc_info=error)
+        message = "Linking failed: " + str(error)
+        if interaction.response.is_done():
+            await interaction.followup.send(message, ephemeral=True)
+        else:
+            await interaction.response.send_message(message, ephemeral=True)
 
 
 async def setup(bot):
