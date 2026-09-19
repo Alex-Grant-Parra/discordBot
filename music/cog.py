@@ -36,7 +36,7 @@ from .librespot import (
 logger = logging.getLogger("music")
 
 spotifyGreen = discord.Colour.from_rgb(30, 215, 96)
-defaultIdleSeconds = 300
+defaultIdleSeconds = 30
 maxRememberedLabels = 500
 maxQueueLines = 10
 maxHistory = 50
@@ -1036,7 +1036,7 @@ class MusicCog(commands.Cog):
         )
         embed.add_field(
             name="From Discord",
-            value="/play, /pause, /resume, /skip, /previous, /seek, /volume, /shuffle, /repeat, /queue, /nowplaying",
+            value="/play, /pause, /resume, /skip, /previous, /seek, /volume, /shuffle, /repeat, /queue, /nowplaying, /jam, /stopjam",
             inline=False,
         )
         embed.add_field(
@@ -1056,14 +1056,7 @@ class MusicCog(commands.Cog):
         status = await self.api.status()
         if status is None:
             raise NotLinkedError()
-        # Only the person who owns the speaker's Spotify account may start a Jam on it,
-        # proven by their /link login being that same account.
-        profile = store.loadUserProfile(interaction.user.id)
-        if not profile or profile.get("spotifyUserId") != status.get("username"):
-            raise UserFacingError(
-                "Only the owner of the speaker's Spotify account can start a Jam. If that is "
-                "you, run /link and log in with that account first."
-            )
+        self.requireAccountOwner(interaction, status, "start a Jam")
 
         await interaction.response.defer(ephemeral=True)
         await self.connectForCommand(interaction)
@@ -1089,6 +1082,40 @@ class MusicCog(commands.Cog):
             await self.reply(interaction, "I could not post in this channel, so here is the link to share: " + link, ephemeral=True)
             return
         await self.reply(interaction, "Posted the Jam invite in " + message.channel.mention + ".", ephemeral=True)
+
+    @app_commands.command(name="stopjam", description="End the Jam running on the speaker's Spotify account (speaker account owner only)")
+    async def stopJam(self, interaction: discord.Interaction):
+        await self.requireSpeaker()
+        status = await self.api.status()
+        if status is None:
+            raise NotLinkedError()
+        self.requireAccountOwner(interaction, status, "end a Jam")
+
+        await interaction.response.defer()
+        if not await self.endJam("by " + self.who(interaction)):
+            raise UserFacingError("No Jam is running on the speaker's account.")
+        await self.reply(interaction, self.who(interaction) + " ended the Jam.")
+
+    async def endJam(self, why):
+        # Ends the Jam on the speaker's account and clears up after it. Returns whether
+        # there was one to end. Raises if Spotify refuses, so /stopjam can say so.
+        current = await self.api.currentJam()
+        if current is not None:
+            await self.api.endJam(current["session_id"])
+            logger.info("Jam %s ended %s", current["session_id"], why)
+        await self.deleteStoredMessage("jamMessage")
+        store.setConfig("jamSessionId", "")
+        return current is not None
+
+    def requireAccountOwner(self, interaction, status, action):
+        # Only the person who owns the speaker's Spotify account may run its Jams, proven
+        # by their /link login being that same account.
+        profile = store.loadUserProfile(interaction.user.id)
+        if not profile or profile.get("spotifyUserId") != status.get("username"):
+            raise UserFacingError(
+                "Only the owner of the speaker's Spotify account can " + action + ". If that is "
+                "you, run /link and log in with that account first."
+            )
 
     async def deleteStoredMessage(self, key):
         channelId, _, messageId = (store.getConfig(key) or "").partition(":")
@@ -1181,16 +1208,16 @@ class MusicCog(commands.Cog):
             ephemeral=True,
         )
 
-    # Leaves when nobody is listening, or when nothing has played for a while
+    # Leaves once nobody else has been in the channel for a while. Paused or stopped
+    # music is no reason to leave, people may just be picking the next song.
 
-    @tasks.loop(seconds=15)
+    @tasks.loop(seconds=5)
     async def idleCheck(self):
         vc = self.voiceClient()
         if vc is None or not vc.is_connected():
             self.idleSince = None
             return
-        listeners = [member for member in vc.channel.members if not member.bot]
-        if listeners and self.playing:
+        if any(not member.bot for member in vc.channel.members):
             self.idleSince = None
             return
 
@@ -1205,8 +1232,24 @@ class MusicCog(commands.Cog):
         channelName = vc.channel.name
         self.leavingOnPurpose = True
         await vc.disconnect(force=False)
-        reason = "nobody was listening" if not listeners else "nothing was playing"
-        await self.notify("Left " + channelName + " because " + reason + ". Casting from Spotify will bring me back.")
+        # Nobody is left to hear it, and a Jam left running keeps the speaker busy for
+        # whoever tries next.
+        endedJam = await self.endJamQuietly("because nobody was listening")
+        message = "Left " + channelName + " because nobody was listening."
+        if endedJam:
+            message += " The Jam has ended too."
+        await self.notify(message + " Casting from Spotify will bring me back.")
+
+    async def endJamQuietly(self, why):
+        # For the idle timer, where nobody is waiting on a reply and a failure must not
+        # stop the rest of the cleanup.
+        if not self.linked:
+            return False
+        try:
+            return await self.endJam(why)
+        except LibrespotError as err:
+            logger.warning("Could not end the Jam on leaving: %s", err)
+            return False
 
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):

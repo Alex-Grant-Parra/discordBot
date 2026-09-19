@@ -33,6 +33,8 @@ webApiQueueUrl = "https://api.spotify.com/v1/me/player/queue"
 jamSessionUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/current_or_new"
 jamInviteUrl = "https://open.spotify.com/socialsession/"
 jamCurrentUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/current"
+jamEndUrl = "https://spclient.wg.spotify.com/social-connect/v3/sessions/{sessionId}"
+jamLeaveUrl = "https://spclient.wg.spotify.com/social-connect/v2/sessions/{sessionId}/leave"
 
 
 class LibrespotError(RuntimeError):
@@ -346,6 +348,30 @@ class LibrespotApi:
         if not session.get("session_id") or session.get("active") is False:
             return None
         return session
+
+    async def endJam(self, sessionId):
+        # Ends the Jam for everyone, which the speaker's account can do as its host. The
+        # older leave call is the fallback in case Spotify has moved the end call again.
+        token = await self.accessToken()
+        if not token:
+            raise NotLinkedError()
+        headers = {"Authorization": "Bearer " + token}
+        attempts = [
+            ("DELETE", jamEndUrl.format(sessionId=sessionId)),
+            ("POST", jamLeaveUrl.format(sessionId=sessionId)),
+        ]
+        statuses = []
+        for method, url in attempts:
+            try:
+                async with self.session.request(method, url, headers=headers, timeout=requestTimeout) as resp:
+                    await resp.read()
+                    if resp.status < 300:
+                        return
+                    statuses.append(resp.status)
+            except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+                raise LibrespotError("Could not reach Spotify to end the Jam") from err
+        logger.warning("Ending Jam %s failed, Spotify answered %s", sessionId, statuses)
+        raise LibrespotError("Spotify answered " + str(statuses[-1]) + " when ending the Jam")
 
     async def upcomingTracks(self):
         # go-librespot only knows the next track, so the full queue comes from the Web API.
