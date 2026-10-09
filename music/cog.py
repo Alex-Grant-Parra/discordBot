@@ -18,7 +18,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from spotipy.oauth2 import SpotifyOauthError
 
-from . import catalog, sharedPlaylist, spotifyAuth, store
+from . import catalog, foreignLinks, sharedPlaylist, spotifyAuth, store
 from .audioBridge import AudioBridge, BridgeSource
 from .userAccounts import LinkError, UserAccounts
 from .librespot import (
@@ -720,6 +720,9 @@ class MusicCog(commands.Cog):
             self.requestedBy.popitem(last=False)
 
     async def searchTracks(self, query, limit=catalog.searchLimit, userId=None):
+        return await self.searchSpotify(userId, catalog.searchTracks, query, limit)
+
+    async def searchSpotify(self, userId, search, *args):
         # Searches as the person's own linked account when there is one, so results
         # follow their country and taste, falling back to the bot's login.
         personal = self.accounts.client(userId) if userId else None
@@ -731,7 +734,7 @@ class MusicCog(commands.Cog):
             )
         for sp in clients:
             try:
-                return await self.runBlocking(catalog.searchTracks, sp, query, limit)
+                return await self.runBlocking(search, sp, *args)
             except (spotipy.SpotifyException, SpotifyOauthError, requests.RequestException) as err:
                 logger.warning("Spotify search failed: %s", err)
         raise UserFacingError("Spotify search failed, try again or paste a Spotify link.")
@@ -752,6 +755,8 @@ class MusicCog(commands.Cog):
         if reference is not None:
             kind, uri = reference
             return kind, uri, self.labels.get(uri) or "that " + kind
+        if foreignLinks.parseLink(query) is not None:
+            return await self.resolveForeignLink(query, userId)
 
         # Typed without picking a suggestion. Prefer the person's own music, the same
         # order the suggestions list shows.
@@ -762,6 +767,23 @@ class MusicCog(commands.Cog):
         if not results:
             raise UserFacingError("Nothing on Spotify matched " + query + ".")
         return "track", results[0]["uri"], results[0]["label"]
+
+    async def resolveForeignLink(self, query, userId):
+        # Apple Music and Amazon Music links play the same song, album or artist from
+        # Spotify, found by name.
+        try:
+            item = await foreignLinks.lookUp(query)
+        except foreignLinks.ForeignLinkError as err:
+            raise UserFacingError(str(err))
+        described = item["name"] + (" by " + item["artist"] if item["artist"] else "")
+        searchText = item["name"] + (" " + item["artist"] if item["artist"] else "")
+        match = await self.searchSpotify(userId, catalog.searchBest, searchText, item["kind"])
+        if match is None:
+            raise UserFacingError(
+                "Could not find " + described + " from " + item["service"] + " on Spotify."
+            )
+        self.rememberLabel(match["uri"], match["label"])
+        return item["kind"], match["uri"], match["label"]
 
     # Commands
 
@@ -803,7 +825,7 @@ class MusicCog(commands.Cog):
         description="Play a song, album or playlist. Songs are queued if something is already playing",
     )
     @app_commands.describe(
-        query="A song name, or a Spotify link to a song, album, playlist or artist",
+        query="A song name, or a Spotify, Apple Music or Amazon Music link",
         now="Play it straight away instead of adding it to the queue",
     )
     async def play(self, interaction: discord.Interaction, query: str, now: bool = False):
@@ -829,7 +851,7 @@ class MusicCog(commands.Cog):
     @play.autocomplete("query")
     async def queryAutocomplete(self, interaction: discord.Interaction, current: str):
         current = current.strip()
-        if catalog.parseReference(current):
+        if catalog.parseReference(current) or foreignLinks.parseLink(current):
             return []
         try:
             # Discord drops autocomplete answers that take longer than 3 seconds. A slow

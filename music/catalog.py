@@ -39,6 +39,16 @@ def searchTracks(sp, query, limit=searchLimit):
     ]
 
 
+def searchBest(sp, query, kind):
+    # The top result of one kind, track, album or artist, or None.
+    results = sp.search(query, limit=1, type=kind) or {}
+    items = (results.get(kind + "s") or {}).get("items") or []
+    for item in items:
+        if item and item.get("uri") and item.get("is_playable", True) is not False:
+            return {"uri": item["uri"], "label": trackLabel(item)}
+    return None
+
+
 def formatMs(ms):
     totalSeconds = max(0, int((ms or 0) / 1000))
     hours, rest = divmod(totalSeconds, 3600)
