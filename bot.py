@@ -72,6 +72,27 @@ async def gif(interaction: discord.Interaction):
     await interaction.response.send_message(file=discord.File(choice))
 
 
+# default_permissions only hides the command from non-admins by default, and server
+# owners can change that in Integrations settings, so admin is also checked when it runs.
+@bot.tree.command(name="say", description="Make the bot say something (admin only)")
+@app_commands.describe(message="Exactly what the bot should say")
+@app_commands.default_permissions(administrator=True)
+@app_commands.guild_only()
+async def say(interaction: discord.Interaction, message: app_commands.Range[str, 1, 2000]):
+    if not interaction.user.guild_permissions.administrator:
+        await interaction.response.send_message("Only server admins can use /say.", ephemeral=True)
+        return
+
+    # Sent as a plain channel message rather than a reply, so it shows as the bot talking
+    # instead of "<user> used /say".
+    try:
+        await interaction.channel.send(message)
+    except discord.Forbidden:
+        await interaction.response.send_message("I don't have permission to send messages in this channel.", ephemeral=True)
+        return
+    await interaction.response.send_message("Sent.", ephemeral=True)
+
+
 def holdSingleInstanceLock():
     # Two copies would share one Spotify speaker and audio pipe and both answer every
     # command. The lock is released by the kernel when the process exits, however it exits.
